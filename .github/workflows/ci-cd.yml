@@ -1,0 +1,113 @@
+name: CloudNova CI/CD
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+# id-token: write -> permite o login no Azure por OIDC (Managed Identity), sem passwords guardadas
+permissions:
+  contents: read
+  id-token: write
+
+env:
+  IMAGE_NAME: cloudnova-portal
+  ACI_NAME: aci-cloudnova-app
+
+jobs:
+  # 1) Validar e compilar o código
+  build-test:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: app
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: app/package-lock.json
+
+      - name: Instalar dependências
+        run: npm ci
+
+      - name: Validar sintaxe (lint)
+        run: npm run lint
+
+      - name: Testes unitários
+        run: npm test
+
+  # 2) Gerar imagem e enviar para o ACR; 3) atualizar a aplicação no ACI
+  build-push-deploy:
+    needs: build-test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Login no Azure (Managed Identity via OIDC - sem segredos)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Build da imagem e push para o Azure Container Registry
+        run: |
+          az acr login --name "${{ secrets.ACR }}"
+          IMAGE="${{ secrets.ACR_LOGIN_SERVER }}/${IMAGE_NAME}"
+          docker build -t "$IMAGE:${GITHUB_SHA::7}" -t "$IMAGE:latest" ./app
+          docker push "$IMAGE:${GITHUB_SHA::7}"
+          docker push "$IMAGE:latest"
+
+      - name: Deploy no Azure Container Instances (frontend-subnet)
+        env:
+          ENTRA_TENANT_ID: ${{ secrets.ENTRA_TENANT_ID }}
+          ENTRA_CLIENT_ID: ${{ secrets.ENTRA_CLIENT_ID }}
+          ENTRA_CLIENT_SECRET: ${{ secrets.ENTRA_CLIENT_SECRET }}
+          DB_SERVER: ${{ secrets.DB_SERVER }}
+          DB_USER: ${{ secrets.SQL_ADMIN }}
+          DB_PASSWORD: ${{ secrets.SQL_PASSWORD }}
+          STORAGE_CONNECTION_STRING: ${{ secrets.STORAGE_CONNECTION_STRING }}
+          SESSION_SECRET: ${{ secrets.SESSION_SECRET }}
+        run: |
+          RG="${{ secrets.RG }}"
+          # Credenciais de pull do ACR obtidas em tempo de execução (nunca guardadas no repositório)
+          ACR_USER=$(az acr credential show -n "${{ secrets.ACR }}" --query username -o tsv)
+          ACR_PASS=$(az acr credential show -n "${{ secrets.ACR }}" --query "passwords[0].value" -o tsv)
+          echo "::add-mask::$ACR_PASS"
+
+          # Só passa ao contentor as variáveis seguras que estão definidas
+          SECURE=()
+          for v in ENTRA_TENANT_ID ENTRA_CLIENT_ID ENTRA_CLIENT_SECRET DB_SERVER DB_USER DB_PASSWORD STORAGE_CONNECTION_STRING SESSION_SECRET; do
+            [ -n "${!v}" ] && SECURE+=("$v=${!v}")
+          done
+
+          # ACI não permite trocar todas as propriedades em vivo: recria o container group
+          az container delete -g "$RG" -n "$ACI_NAME" --yes || true
+
+          az container create \
+            -g "$RG" -n "$ACI_NAME" \
+            --image "${{ secrets.ACR_LOGIN_SERVER }}/${IMAGE_NAME}:${GITHUB_SHA::7}" \
+            --registry-login-server "${{ secrets.ACR_LOGIN_SERVER }}" \
+            --registry-username "$ACR_USER" --registry-password "$ACR_PASS" \
+            --os-type Linux --cpu 1 --memory 1.5 \
+            --vnet "${{ secrets.VNET }}" --subnet frontend-subnet \
+            --ip-address Private --ports 8080 \
+            --restart-policy Always \
+            --environment-variables \
+              APP_VERSION="${GITHUB_SHA::7}" \
+              PORT=8080 \
+              REDIRECT_URI="http://localhost:8080/auth/callback" \
+              DB_NAME="${{ secrets.SQL_DB }}" \
+              STORAGE_CONTAINER="ficheiros-empresa" \
+            --secure-environment-variables "${SECURE[@]}" \
+            -o none
+
+      - name: Verificar o deploy
+        run: |
+          az container show -g "${{ secrets.RG }}" -n "$ACI_NAME" \
+            --query "{Estado:instanceView.state, IP:ipAddress.ip, Imagem:containers[0].image}" -o table
+          sleep 20
+          az container logs -g "${{ secrets.RG }}" -n "$ACI_NAME" | tail -n 20
