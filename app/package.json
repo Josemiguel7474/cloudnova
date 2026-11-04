@@ -1,0 +1,22 @@
+{
+  "name": "cloudnova-portal",
+  "version": "1.0.0",
+  "description": "Portal Corporativo Seguro CloudNova - Entra ID + Azure SQL + Blob Storage",
+  "main": "src/server.js",
+  "scripts": {
+    "start": "node src/server.js",
+    "lint": "node --check src/server.js && node --check src/app.js && node --check src/db.js && node --check src/storage.js && node --check src/auth.js",
+    "test": "node --test"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "@azure/msal-node": "^2.16.2",
+    "@azure/storage-blob": "^12.26.0",
+    "express": "^4.21.2",
+    "express-session": "^1.18.1",
+    "mssql": "^11.0.1",
+    "multer": "^1.4.5-lts.1"
+  }
+}
